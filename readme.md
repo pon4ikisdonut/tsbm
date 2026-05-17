@@ -1,8 +1,12 @@
 # Telegram Spotify Bio Monitor
 
-This script updates your Telegram profile bio with the track you are currently listening to on Spotify.
+This project updates your Telegram profile bio with the track you are currently listening to on Spotify.
 
-It checks the current media session on Windows and automatically changes your Telegram bio to show the current song. If nothing is playing, it can display a custom fallback text instead.
+It supports:
+- `windows.py` — Windows version using the Windows media session API
+- `linux.py` — Linux version using MPRIS via `playerctl`
+
+If nothing is playing, the script can show a custom fallback text instead.
 
 ## Features
 
@@ -10,14 +14,24 @@ It checks the current media session on Windows and automatically changes your Te
 - Updates automatically every few seconds
 - Supports a custom text when nothing is playing
 - Lets you customize the bio prefix
-- Keeps the bio within Telegram's length limit
+- Keeps the bio within Telegram's bio length limit
+- Supports both Windows and Linux
 
 ## Requirements
 
 - Python 3.10+
-- Windows
 - A Telegram account
 - Spotify desktop app
+
+### Platform-specific requirements
+
+#### Windows
+- `windows.py`
+- `winsdk`
+
+#### Linux
+- `linux.py`
+- `playerctl`
 
 ## Installation
 
@@ -28,10 +42,47 @@ git clone https://github.com/pon4ikisdonut/tsbm.git
 cd tsbm
 ```
 
-Then install the required dependencies:
+### Windows setup
+
+Install Python dependencies:
 
 ```bash
 pip install telethon winsdk
+```
+
+Run:
+
+```bash
+python windows.py
+```
+
+### Linux setup
+
+Install Python dependencies:
+
+```bash
+pip install telethon
+```
+
+Install `playerctl` using your distro package manager.
+
+Examples:
+
+```bash
+# Debian / Ubuntu
+sudo apt install playerctl
+
+# Arch Linux
+sudo pacman -S playerctl
+
+# Fedora
+sudo dnf install playerctl
+```
+
+Run:
+
+```bash
+python linux.py
 ```
 
 ## Telegram API setup
@@ -59,7 +110,7 @@ API_HASH = "your_api_hash_here"
 
 ## Configuration
 
-You can customize several variables in the script:
+You can customize several variables in both scripts:
 
 ### `PREFIX`
 Text shown before the song title.
@@ -85,7 +136,7 @@ How often the script checks Spotify status.
 Example:
 
 ```python
-POLL_SECONDS = 5
+POLL_SECONDS = 13
 ```
 
 ### `BIO_LIMIT`
@@ -99,10 +150,16 @@ BIO_LIMIT = 70
 
 ## Usage
 
-Run the script with:
+Run the version for your platform:
 
 ```bash
-python main.py
+python windows.py
+```
+
+or
+
+```bash
+python linux.py
 ```
 
 On the first launch, Telegram may ask you to log in and confirm the session. After that, the script will keep running and update your bio automatically.
@@ -123,7 +180,8 @@ Not playing
 
 ## Notes
 
-- This script works with the Spotify desktop app on Windows
+- `windows.py` works on Windows with the Spotify desktop app
+- `linux.py` works on Linux with Spotify and `playerctl`
 - Your Telegram bio is updated only when the text changes
 - If the track title is too long, it will be shortened automatically
 
