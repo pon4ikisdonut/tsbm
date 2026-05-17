@@ -27,10 +27,12 @@ If nothing is playing, the script can show a custom fallback text instead.
 
 #### Windows
 - `windows.py`
+- `telethon`
 - `winsdk`
 
 #### Linux
 - `linux.py`
+- `telethon`
 - `playerctl`
 
 ## Installation
