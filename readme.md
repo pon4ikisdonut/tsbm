@@ -21,7 +21,14 @@ It checks the current media session on Windows and automatically changes your Te
 
 ## Installation
 
-First, install the required dependencies:
+Clone the repository:
+
+```bash
+git clone https://github.com/pon4ikisdonut/tsbm.git
+cd tsbm
+```
+
+Then install the required dependencies:
 
 ```bash
 pip install telethon winsdk
