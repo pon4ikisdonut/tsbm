@@ -1,84 +1,330 @@
 import asyncio
-from telethon import TelegramClient
-from telethon.tl.functions.account import UpdateProfileRequest
+import contextlib
+import re
+from pathlib import Path
 
+from telethon import TelegramClient, functions, types
+from mutagen.id3 import ID3, TIT2, TPE1, ID3NoHeaderError
 
-API_ID = put-your-app-id-here
-API_HASH = "put-your-api-hash-here"
+API_ID = "your_app_id"
+API_HASH = "your_api_hash"
 SESSION_NAME = "tg_spotify_bio"
 
+DOWNLOAD_DIR = Path.home() / "tg_music_status"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-BIO_LIMIT = 70
-POLL_SECONDS = 13
-PREFIX = "Сейчас слушаю:"
-NOT_PLAYING = "Пока ничего не слушаю..."
+POLL_SECONDS = 3
+PREFIX = "🎵"
 
-
-def trim_bio(text: str, limit: int = BIO_LIMIT) -> str:
-    text = text.strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
+_file_cache: dict[str, Path] = {}
 
 
-async def run_playerctl(*args):
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
+
+
+def _first_frame_text(tags: ID3, key: str) -> str:
+    frames = tags.getall(key)
+    if not frames:
+        return ""
+    text = getattr(frames[0], "text", None)
+    if isinstance(text, list):
+        return str(text[0]).strip() if text else ""
+    return str(text).strip() if text is not None else ""
+
+
+def write_fast_id3(file_path: Path, title: str, artist: str) -> None:
     try:
-        process = await asyncio.create_subprocess_exec(
-            "playerctl",
-            "--player=spotify",
-            *args,
+        try:
+            tags = ID3(str(file_path))
+        except ID3NoHeaderError:
+            tags = ID3()
+
+        current_title = _first_frame_text(tags, "TIT2")
+        current_artist = _first_frame_text(tags, "TPE1")
+
+        wanted_artist = artist.strip() if artist else title.strip()
+        wanted_title = title.strip()
+
+        if current_title == wanted_title and current_artist == wanted_artist:
+            print(f"[meta skip] {wanted_artist} — {wanted_title}")
+            return
+
+        tags.delall("TIT2")
+        tags.delall("TPE1")
+        tags["TIT2"] = TIT2(encoding=3, text=wanted_title)
+        tags["TPE1"] = TPE1(encoding=3, text=wanted_artist)
+        tags.save(str(file_path), v2_version=3)
+
+        print(f"[meta] {wanted_artist} — {wanted_title}")
+    except Exception as e:
+        print(f"[meta error] {e}")
+
+
+async def _run(cmd: list[str]) -> str | None:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-    except FileNotFoundError:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode != 0:
+            return None
+        return stdout.decode().strip()
+    except (asyncio.TimeoutError, FileNotFoundError):
         return None
 
-    stdout, stderr = await process.communicate()
 
-    if process.returncode != 0:
+async def get_current_track() -> dict | None:
+    status = await _run(["playerctl", "--player=spotify", "status"])
+    if not status or status.lower() != "playing":
         return None
 
-    return stdout.decode("utf-8", errors="ignore").strip()
-
-
-async def get_spotify_bio():
-    status = await run_playerctl("status", "--format", "{{ uc(status) }}")
-    if status != "PLAYING":
-        return trim_bio(NOT_PLAYING)
-
-    metadata = await run_playerctl("metadata", "--format", "{{ artist }}|||{{ title }}")
-    if not metadata or "|||" not in metadata:
-        return trim_bio(NOT_PLAYING)
-
-    artist, title = metadata.split("|||", 1)
-    artist = artist.strip()
-    title = title.strip()
+    title = await _run(["playerctl", "--player=spotify", "metadata", "title"])
+    artist = await _run(["playerctl", "--player=spotify", "metadata", "artist"])
 
     if not title:
-        return trim_bio(NOT_PLAYING)
+        return None
 
-    if artist:
-        return trim_bio(f"{PREFIX} {artist} - {title}")
-    return trim_bio(f"{PREFIX} {title}")
+    return {"title": title, "artist": artist or ""}
+
+
+# alternative method using dbus-python (uncomment to use)
+# and pip install dbus-python
+#
+# import dbus
+#
+# async def get_current_track() -> dict | None:
+#     def _dbus_query():
+#         try:
+#             bus = dbus.SessionBus()
+#             player = bus.get_object(
+#                 "org.mpris.MediaPlayer2.spotify",
+#                 "/org/mpris/MediaPlayer2"
+#             )
+#             props = dbus.Interface(player, "org.freedesktop.DBus.Properties")
+#             status = str(props.Get("org.mpris.MediaPlayer2.Player", "PlaybackStatus"))
+#             if status != "Playing":
+#                 return None
+#             meta = props.Get("org.mpris.MediaPlayer2.Player", "Metadata")
+#             title = str(meta.get("xesam:title", "")).strip()
+#             artists = meta.get("xesam:artist", [])
+#             artist = str(artists[0]).strip() if artists else ""
+#             return {"title": title, "artist": artist} if title else None
+#         except dbus.DBusException:
+#             return None
+#     return await asyncio.to_thread(_dbus_query)
+
+
+
+async def download_track(title: str, artist: str) -> Path | None:
+    cache_key = f"{artist} - {title}" if artist else title
+    safe_name = sanitize_filename(cache_key)
+
+    if cache_key in _file_cache and _file_cache[cache_key].exists():
+        print(f"[cache hit] {cache_key}")
+        return _file_cache[cache_key]
+
+    exact_mp3 = DOWNLOAD_DIR / f"{safe_name}.mp3"
+    if exact_mp3.exists():
+        _file_cache[cache_key] = exact_mp3
+        print(f"[disk cache] {cache_key}")
+        return exact_mp3
+
+    existing = next(DOWNLOAD_DIR.glob(f"{safe_name}.*"), None)
+    if existing:
+        _file_cache[cache_key] = existing
+        print(f"[disk cache] {cache_key}")
+        return existing
+
+    query = f"ytsearch1:{cache_key} lyrics"
+    out_template = str(DOWNLOAD_DIR / f"{safe_name}.%(ext)s")
+
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--output", out_template,
+        "--no-post-overwrites",
+        "--retries", "3",
+        "--format", "bestaudio/best",
+        "--cookies-from-browser", "firefox", # or "chrome", "brave", etc.
+        "--remote-components", "ejs:github",
+        query,
+    ]
+
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=None,
+            stderr=None,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=90)
+
+        if proc.returncode != 0:
+            print(f"[yt-dlp] Процесс завершился с ошибкой, код: {proc.returncode}")
+            return None
+    except asyncio.CancelledError:
+        if proc and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    await proc.wait()
+        raise
+    except asyncio.TimeoutError:
+        print("[yt-dlp] timeout")
+        if proc and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+        return None
+    except FileNotFoundError:
+        print("[yt-dlp] not found — pip install yt-dlp")
+        return None
+
+    if exact_mp3.exists():
+        _file_cache[cache_key] = exact_mp3
+        return exact_mp3
+
+    result = next(DOWNLOAD_DIR.glob(f"{safe_name}.*"), None)
+    if result:
+        _file_cache[cache_key] = result
+        return result
+
+    return None
+
+
+def make_input_doc(doc) -> types.InputDocument:
+    return types.InputDocument(
+        id=doc.id,
+        access_hash=doc.access_hash,
+        file_reference=doc.file_reference,
+    )
+
+
+async def cleanup_old(client: TelegramClient, msg_id: int) -> None:
+    try:
+        await client.delete_messages("me", [msg_id])
+        print(f"[cleanup] Удалено id={msg_id}")
+    except Exception as e:
+        print(f"[delete msg] {e}")
 
 
 async def main():
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     await client.start()
 
-    last_bio = None
+    last_track: dict | None = None
+    last_msg_id: int | None = None
+    download_task: asyncio.Task | None = None
+    idle_logged = False
+
+    async def process_track(track: dict) -> None:
+        nonlocal last_msg_id
+
+        caption = (
+            f"{PREFIX} {track['artist']} — {track['title']}"
+            if track["artist"] else f"{PREFIX} {track['title']}"
+        )
+        print(f"[download] {caption}")
+
+        try:
+            file_path = await download_track(track["title"], track["artist"])
+            if not file_path:
+                return
+
+            await asyncio.to_thread(
+                write_fast_id3,
+                file_path,
+                track["title"],
+                track["artist"],
+            )
+
+            msg = await client.send_file(
+                "me",
+                str(file_path),
+                caption=caption,
+                voice_note=False,
+                attributes=[
+                    types.DocumentAttributeAudio(
+                        duration=0,
+                        title=track["title"],
+                        performer=track["artist"],
+                    )
+                ],
+            )
+
+            doc = msg.document
+            if doc:
+                try:
+                    await client(functions.account.SaveMusicRequest(
+                        id=make_input_doc(doc),
+                        unsave=False,
+                    ))
+                    last_msg_id = msg.id
+                    print(f"[music] Сохранено: {caption}")
+                except Exception as e:
+                    print(f"[music save] {e}")
+            else:
+                print("[music] document не найден")
+
+        except asyncio.CancelledError:
+            print(f"[cancel] {caption}")
+            raise
+        except Exception as e:
+            print(f"[process error] {e}")
 
     while True:
         try:
-            bio = await get_spotify_bio()
+            track = await get_current_track()
 
-            if bio != last_bio:
-                await client(UpdateProfileRequest(about=bio))
-                last_bio = bio
-                print("Updated:", bio)
+            if track is None:
+                if not idle_logged:
+                    print("[status] Ничего не играет")
+                    idle_logged = True
+
+                if track != last_track:
+                    if download_task and not download_task.done():
+                        download_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await download_task
+
+                    if last_msg_id is not None:
+                        asyncio.create_task(cleanup_old(client, last_msg_id))
+                        last_msg_id = None
+
+                    last_track = track
+
+                await asyncio.sleep(POLL_SECONDS)
+                continue
+
+            idle_logged = False
+
+            if track != last_track:
+                if download_task and not download_task.done():
+                    download_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await download_task
+
+                if last_msg_id is not None:
+                    asyncio.create_task(cleanup_old(client, last_msg_id))
+                    last_msg_id = None
+
+                download_task = asyncio.create_task(process_track(track))
+                last_track = track
 
         except Exception as e:
-            print("Error:", e)
+            print(f"[error] {e}")
 
         await asyncio.sleep(POLL_SECONDS)
 
